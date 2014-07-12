@@ -261,6 +261,48 @@ static ssize_t genpipe_read(struct file *filp, char __user *buf,
 	return copy_len;
 }
 
+/* from af_packet.c */
+static int packet_direct_xmit(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	const struct net_device_ops *ops = dev->netdev_ops;
+	netdev_features_t features;
+	struct netdev_queue *txq;
+	int ret = NETDEV_TX_BUSY;
+	u16 queue_map;
+
+	if (unlikely(!netif_running(dev) || !netif_carrier_ok(dev)))
+		goto drop;
+
+	features = netif_skb_features(skb);
+	if (skb_needs_linearize(skb, features) && __skb_linearize(skb))
+		goto drop;
+
+	queue_map = skb_get_queue_mapping(skb);
+	txq = netdev_get_tx_queue(dev, queue_map);
+
+	local_bh_disable();
+
+	HARD_TX_LOCK(dev, txq, smp_processor_id());
+	if (!netif_xmit_frozen_or_drv_stopped(txq)) {
+		ret = ops->ndo_start_xmit(skb, dev);
+		if (ret == NETDEV_TX_OK)
+			txq_trans_update(txq);
+	}
+	HARD_TX_UNLOCK(dev, txq);
+
+	local_bh_enable();
+
+	if (!dev_xmit_complete(ret))
+		kfree_skb(skb);
+
+	return ret;
+drop:
+	atomic_long_inc(&dev->tx_dropped);
+	kfree_skb(skb);
+	return NET_XMIT_DROP;
+}
+
 static ssize_t genpipe_write(struct file *filp, const char __user *buf,
 			    size_t count, loff_t *ppos)
 
@@ -268,7 +310,7 @@ static ssize_t genpipe_write(struct file *filp, const char __user *buf,
 	int i, copy_len, ret, frame_len, data, data2;
 	struct sk_buff *tx_skb;
 	unsigned char *cr;
-	static unsigned char tmp_pkt[MTU+14]={0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+	static unsigned char tmp_pkt[MTU+14]={0};
 
 	copy_len = 0;
 	tx_skb = NULL;
@@ -285,7 +327,7 @@ static ssize_t genpipe_write(struct file *filp, const char __user *buf,
 		count = (pbuf0.tx_end_ptr - pbuf0.tx_write_ptr);
 
 	if (debug) {
-		pr_info( "%s count=%d\n", __func__, count );
+		pr_info( "%s count=%d\n", __func__, (int)count );
 	}
 
 	if ( copy_from_user( pbuf0.tx_write_ptr, buf, count ) ) {
@@ -348,12 +390,20 @@ genpipe_write_loop:
 			INFO_SKB(tx_skb);
 		}
 
-		// xmit
+#if 0
 		tx_skb->dev = device;
 		tx_skb->protocol = eth_type_trans(tx_skb, device);
 		ret = dev_queue_xmit(tx_skb);
 		if (ret) {
 			pr_info( "fail to dev_queue_xmit=%d\n", ret );
+		}
+#endif
+		// xmit
+		tx_skb->dev = device;
+		tx_skb->protocol = eth_type_trans(tx_skb, device);
+		ret = packet_direct_xmit(tx_skb);
+		if (ret) {
+			pr_info( "fail packet_direct_xmit=%d\n", ret );
 		}
 	}
 
